@@ -12,6 +12,7 @@
 #include <zephyr/bluetooth/hci.h>
 #include <bluetooth/services/nus.h>
 
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -45,6 +46,10 @@
 
 /* BMI270 +/-2g sensitivity */
 #define BMI270_ACC_LSB_PER_G          16384
+#define AIRPLANE_MAX_MINUTES   1440   /* 24 h cap */
+
+static volatile bool airplane_mode = false;
+static volatile uint32_t airplane_req_ms = 0;
 
 static struct i2c_dt_spec bmi270_i2c = I2C_DT_SPEC_GET(BMI270_NODE);
 static struct bmi2_dev bmi270_dev;
@@ -287,7 +292,7 @@ static int bmi270_bosch_init_sensor(void)
     acc_cfg.type = BMI2_ACCEL;
     acc_cfg.cfg.acc.odr = BMI2_ACC_ODR_50HZ;
     acc_cfg.cfg.acc.bwp = BMI2_ACC_NORMAL_AVG4;
-    acc_cfg.cfg.acc.filter_perf = BMI2_POWER_OPT_MODE;
+    acc_cfg.cfg.acc.filter_perf = BMI2_PERF_OPT_MODE;
     acc_cfg.cfg.acc.range = BMI2_ACC_RANGE_2G;
 
     rslt = bmi270_set_sensor_config(&acc_cfg, 1, &bmi270_dev);
@@ -553,6 +558,12 @@ static int start_ble_advertising(void)
 {
     int err;
 
+    if (airplane_mode) {
+    printk("Airplane mode active, advertising blocked\n");
+    return 0;
+    }
+
+
     if (advertising_active) {
         return 0;
     }
@@ -766,6 +777,84 @@ static void wake_from_sleep_mode(void)
     start_ble_advertising();
 }
 
+/* ---------- Airplane mode ---------- */
+
+static void airplane_start_work_handler(struct k_work *work);
+static void airplane_end_work_handler(struct k_work *work);
+
+static K_WORK_DEFINE(airplane_start_work, airplane_start_work_handler);
+static K_WORK_DELAYABLE_DEFINE(airplane_end_work, airplane_end_work_handler);
+
+static void airplane_start_work_handler(struct k_work *work)
+{
+    uint32_t duration_ms = airplane_req_ms;
+
+    ARG_UNUSED(work);
+
+    /* Set flag first so the disconnect callback can't restart advertising */
+    airplane_mode = true;
+    k_work_reschedule(&airplane_end_work, K_MSEC(duration_ms));
+
+    printk("\nAirplane mode ON for %lu s. BLE going off.\n",
+           (unsigned long)(duration_ms / 1000U));
+
+    save_step_count_to_flash();
+
+    if (current_conn && notify_enabled) {
+        ble_send_text("APM:OK\n");
+        k_sleep(K_MSEC(200));
+    }
+
+    if (current_conn) {
+        bt_conn_disconnect(current_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    } else {
+        stop_ble_advertising();
+    }
+}
+
+static void airplane_end_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    airplane_mode = false;
+    printk("\nAirplane mode OFF. BLE back on.\n");
+
+    /* If in motion-sleep, advertising resumes on wake instead */
+    if (!sleep_mode) {
+        start_ble_advertising();
+    }
+}
+
+static int airplane_request_ms(uint32_t ms)
+{
+    if (ms == 0 || ms > (AIRPLANE_MAX_MINUTES * 60000U)) {
+        return -EINVAL;
+    }
+
+    airplane_req_ms = ms;
+    k_work_submit(&airplane_start_work);
+    return 0;
+}
+
+static int parse_u32(const char *s, uint32_t *out)
+{
+    char *end;
+    unsigned long v = strtoul(s, &end, 10);
+
+    if (end == s) {
+        return -EINVAL;
+    }
+    while (*end == '\n' || *end == '\r' || *end == ' ') {
+        end++;
+    }
+    if (*end != '\0') {
+        return -EINVAL;
+    }
+
+    *out = (uint32_t)v;
+    return 0;
+}
+
 /* ---------- BLE callbacks ---------- */
 
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -821,6 +910,27 @@ static void nus_received_cb(struct bt_conn *conn,
 
     if (rx_buf[0] == 'r' || rx_buf[0] == 'R') {
         reset_step_counter(true);
+    } else if (strncmp(rx_buf, "AP:", 3) == 0) {
+        uint32_t minutes;
+
+        if (parse_u32(&rx_buf[3], &minutes) == 0 &&
+            minutes <= AIRPLANE_MAX_MINUTES &&
+            airplane_request_ms(minutes * 60000U) == 0) {
+            printk("Airplane request: %lu min\n", (unsigned long)minutes);
+        } else {
+            printk("Bad airplane command: %s\n", rx_buf);
+        }
+    } else if (strncmp(rx_buf, "APS:", 4) == 0) {
+        /* Seconds variant, for quick testing only */
+        uint32_t seconds;
+
+        if (parse_u32(&rx_buf[4], &seconds) == 0 &&
+            seconds <= 86400U &&
+            airplane_request_ms(seconds * 1000U) == 0) {
+            printk("Airplane request: %lu s\n", (unsigned long)seconds);
+        } else {
+            printk("Bad airplane command: %s\n", rx_buf);
+        }
     }
 }
 
